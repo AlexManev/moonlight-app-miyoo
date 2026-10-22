@@ -1,0 +1,421 @@
+From 382362122b7353449b4e4e147d57ac99ca345684 Mon Sep 17 00:00:00 2001
+From: alexmanev <amanev95@gmail.com>
+Date: Thu, 22 Oct 2026 13:04:20 +0000
+Subject: [PATCH] Add gamepad mode: expose the Miyoo keypad as a game
+ controller
+
+The MMiyoo joystick driver now reports the keypad as an Xbox style
+controller while the app has it open (moonlight does this when a stream
+starts). Select+X toggles between keyboard and gamepad mode, and the
+starting mode, d-pad as left stick and button layout are read from the
+"gamepad" block in config/settings.json.
+---
+ src/cfg/SDL_moonlightcfg_mmiyoo.c         |  32 ++++++
+ src/cfg/SDL_moonlightcfg_mmiyoo.h         |  10 ++
+ src/joystick/mmiyoo/SDL_joystick_mmiyoo.c | 123 +++++++++++++++++++++-
+ src/video/mmiyoo/SDL_event_mmiyoo.c       |  86 ++++++++++++++-
+ src/video/mmiyoo/SDL_event_mmiyoo.h       |   3 +
+ 5 files changed, 247 insertions(+), 7 deletions(-)
+
+diff --git a/src/cfg/SDL_moonlightcfg_mmiyoo.c b/src/cfg/SDL_moonlightcfg_mmiyoo.c
+index 521a4a6..01ac541 100644
+--- a/src/cfg/SDL_moonlightcfg_mmiyoo.c
++++ b/src/cfg/SDL_moonlightcfg_mmiyoo.c
+@@ -58,6 +58,37 @@ int cfgReadMouse(struct json_object *jfile) {
+     return 0;
+ }
+ 
++int cfgReadGamepad(struct json_object *jfile) {
++    struct json_object *jval = NULL;
++    struct json_object *jEnabled = NULL;
++    struct json_object *jDpadAsLeftStick = NULL;
++    struct json_object *jUseButtonLabels = NULL;
++
++    moon.gamepad.enabled = MMIYOO_DEFAULT_GAMEPAD_ENABLED;
++    moon.gamepad.dpadAsLeftStick = MMIYOO_DEFAULT_GAMEPAD_DPAD_AS_STICK;
++    moon.gamepad.useButtonLabels = MMIYOO_DEFAULT_GAMEPAD_BUTTON_LABELS;
++
++    json_object_object_get_ex(jfile, "gamepad", &jval);
++    if (!jval) {
++        printf("Gamepad settings not found in json file. Using defaults.\n");
++        return 0;
++    }
++
++    if (json_object_object_get_ex(jval, "enabled", &jEnabled)) {
++        moon.gamepad.enabled = json_object_get_boolean(jEnabled);
++    }
++    if (json_object_object_get_ex(jval, "dpadAsLeftStick", &jDpadAsLeftStick)) {
++        moon.gamepad.dpadAsLeftStick = json_object_get_boolean(jDpadAsLeftStick);
++    }
++    if (json_object_object_get_ex(jval, "useButtonLabels", &jUseButtonLabels)) {
++        moon.gamepad.useButtonLabels = json_object_get_boolean(jUseButtonLabels);
++    }
++
++    printf("[json] Gamepad settings: enabled=%d, dpadAsLeftStick=%d, useButtonLabels=%d\n",
++           moon.gamepad.enabled, moon.gamepad.dpadAsLeftStick, moon.gamepad.useButtonLabels);
++    return 0;
++}
++
+ int cfgReadClock(struct json_object *jfile) {
+     struct json_object *jval = NULL;
+     json_object_object_get_ex(jfile, "cpuclock", &jval);
+@@ -210,6 +241,7 @@ int read_moonlight_config(void)
+     cfgReadCustomKeys(jfile);
+     cfgReadClock(jfile);
+     cfgReadMouse(jfile);
++    cfgReadGamepad(jfile);
+ 
+     json_object_put(jfile);
+     return 0;
+diff --git a/src/cfg/SDL_moonlightcfg_mmiyoo.h b/src/cfg/SDL_moonlightcfg_mmiyoo.h
+index 123982f..cb09f65 100644
+--- a/src/cfg/SDL_moonlightcfg_mmiyoo.h
++++ b/src/cfg/SDL_moonlightcfg_mmiyoo.h
+@@ -30,6 +30,9 @@
+ #define MMIYOO_DEFAULT_ACCELERATION 2.0
+ #define MMIYOO_DEFAULT_ACCELERATION_RATE 2.5
+ #define MMIYOO_DEFAULT_MAX_ACCELERATION 10.0
++#define MMIYOO_DEFAULT_GAMEPAD_ENABLED 0
++#define MMIYOO_DEFAULT_GAMEPAD_DPAD_AS_STICK 0
++#define MMIYOO_DEFAULT_GAMEPAD_BUTTON_LABELS 0
+ 
+ SDL_Keycode stringToKeycode(const char *keyString);
+ int read_moonlight_config(void);
+@@ -60,11 +63,18 @@ typedef struct _MOUSE {
+     float maxAcceleration;
+ } MOUSE;
+ 
++typedef struct _GAMEPAD {
++    int enabled;        // start streams in gamepad mode
++    int dpadAsLeftStick; // dpad drives the left analog stick instead of the dpad
++    int useButtonLabels; // map by label (Miyoo A -> Xbox A) instead of by position
++} GAMEPAD;
++
+ typedef struct _MOON {
+     int cpuclock;
+     char cfg_path[MAX_PATH];
+     CUSTKEY customkey;
+     MOUSE mouse;
++    GAMEPAD gamepad;
+ } MOON;
+ 
+ #endif
+\ No newline at end of file
+diff --git a/src/joystick/mmiyoo/SDL_joystick_mmiyoo.c b/src/joystick/mmiyoo/SDL_joystick_mmiyoo.c
+index e95b19b..78d185e 100644
+--- a/src/joystick/mmiyoo/SDL_joystick_mmiyoo.c
++++ b/src/joystick/mmiyoo/SDL_joystick_mmiyoo.c
+@@ -29,9 +29,43 @@
+ #include "SDL_joystick.h"
+ #include "../SDL_sysjoystick.h"
+ #include "../SDL_joystick_c.h"
++#include "SDL_hints.h"
++#include "../../video/SDL_sysvideo.h"
++#include "../../video/mmiyoo/SDL_event_mmiyoo.h"
++#include "../../cfg/SDL_moonlightcfg_mmiyoo.h"
++
++extern MOON moon;
++
++/* Virtual joystick layout; the gamepad mapping below turns it into an Xbox style controller */
++enum {
++    MMIYOO_JOY_A,
++    MMIYOO_JOY_B,
++    MMIYOO_JOY_X,
++    MMIYOO_JOY_Y,
++    MMIYOO_JOY_BACK,
++    MMIYOO_JOY_GUIDE,
++    MMIYOO_JOY_START,
++    MMIYOO_JOY_LEFTSHOULDER,
++    MMIYOO_JOY_RIGHTSHOULDER,
++    MMIYOO_JOY_LEFTTRIGGER,
++    MMIYOO_JOY_RIGHTTRIGGER,
++    MMIYOO_JOY_DPUP,
++    MMIYOO_JOY_DPDOWN,
++    MMIYOO_JOY_DPLEFT,
++    MMIYOO_JOY_DPRIGHT,
++    MMIYOO_JOY_NUM_BUTTONS
++};
++
++#define MMIYOO_JOY_AXIS_LEFTX 0
++#define MMIYOO_JOY_AXIS_LEFTY 1
++#define MMIYOO_JOY_NUM_AXES   2
++
++static Uint32 pre_joy_bitmaps = 0;
+ 
+ static int MMIYOO_JoystickInit(void)
+ {
++    /* The mmiyoo video driver never sets keyboard focus, which would make SDL drop all joystick events */
++    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+     return 1;
+ }
+ 
+@@ -74,9 +108,11 @@ static SDL_JoystickID MMIYOO_JoystickGetDeviceInstanceID(int device_index)
+ 
+ static int MMIYOO_JoystickOpen(SDL_Joystick *joystick, int device_index)
+ {
+-    joystick->nbuttons = 14;
+-    joystick->naxes = 2;
++    joystick->nbuttons = MMIYOO_JOY_NUM_BUTTONS;
++    joystick->naxes = MMIYOO_JOY_NUM_AXES;
+     joystick->nhats = 0;
++    pre_joy_bitmaps = 0;
++    MMIYOO_EventSetGamepadAttached(1);
+     return 0;
+ }
+ 
+@@ -110,12 +146,71 @@ static int MMIYOO_JoystickSetSensorsEnabled(SDL_Joystick *joystick, SDL_bool ena
+     return SDL_Unsupported();
+ }
+ 
++static Uint32 MMIYOO_KeypadToJoystick(Uint32 keypad)
++{
++    /* The Miyoo face buttons are Nintendo style (A right, B bottom). By default they are mapped
++       by position so the bottom button is Xbox A, or by label when useButtonLabels is set. */
++    static const int positional[] = { MYKEY_B, MYKEY_A, MYKEY_Y, MYKEY_X };
++    static const int labeled[] = { MYKEY_A, MYKEY_B, MYKEY_X, MYKEY_Y };
++    const int *face = moon.gamepad.useButtonLabels ? labeled : positional;
++    Uint32 joy = 0;
++    int i;
++
++    for (i = 0; i < 4; i++) {
++        if (keypad & (1 << face[i])) {
++            joy |= (1 << (MMIYOO_JOY_A + i));
++        }
++    }
++
++#define MMIYOO_MAP_KEY(mykey, joybutton) if (keypad & (1 << (mykey))) joy |= (1 << (joybutton))
++    MMIYOO_MAP_KEY(MYKEY_SELECT, MMIYOO_JOY_BACK);
++    MMIYOO_MAP_KEY(MYKEY_MENU, MMIYOO_JOY_GUIDE);
++    MMIYOO_MAP_KEY(MYKEY_START, MMIYOO_JOY_START);
++    MMIYOO_MAP_KEY(MYKEY_L1, MMIYOO_JOY_LEFTSHOULDER);
++    MMIYOO_MAP_KEY(MYKEY_R1, MMIYOO_JOY_RIGHTSHOULDER);
++    MMIYOO_MAP_KEY(MYKEY_L2, MMIYOO_JOY_LEFTTRIGGER);
++    MMIYOO_MAP_KEY(MYKEY_R2, MMIYOO_JOY_RIGHTTRIGGER);
++    if (!moon.gamepad.dpadAsLeftStick) {
++        MMIYOO_MAP_KEY(MYKEY_UP, MMIYOO_JOY_DPUP);
++        MMIYOO_MAP_KEY(MYKEY_DOWN, MMIYOO_JOY_DPDOWN);
++        MMIYOO_MAP_KEY(MYKEY_LEFT, MMIYOO_JOY_DPLEFT);
++        MMIYOO_MAP_KEY(MYKEY_RIGHT, MMIYOO_JOY_DPRIGHT);
++    }
++#undef MMIYOO_MAP_KEY
++
++    return joy;
++}
++
+ static void MMIYOO_JoystickUpdate(SDL_Joystick *joystick)
+ {
++    Uint32 keypad = MMIYOO_EventGetGamepadBitmaps();
++    Uint32 joy = MMIYOO_KeypadToJoystick(keypad);
++    Uint32 changed = joy ^ pre_joy_bitmaps;
++    Sint16 x = 0, y = 0;
++    int i;
++
++    for (i = 0; i < MMIYOO_JOY_NUM_BUTTONS; i++) {
++        if (changed & (1 << i)) {
++            SDL_PrivateJoystickButton(joystick, i, (joy & (1 << i)) ? SDL_PRESSED : SDL_RELEASED);
++        }
++    }
++    pre_joy_bitmaps = joy;
++
++    if (moon.gamepad.dpadAsLeftStick) {
++        if (keypad & (1 << MYKEY_LEFT)) x -= SDL_JOYSTICK_AXIS_MAX;
++        if (keypad & (1 << MYKEY_RIGHT)) x += SDL_JOYSTICK_AXIS_MAX;
++        if (keypad & (1 << MYKEY_UP)) y -= SDL_JOYSTICK_AXIS_MAX;
++        if (keypad & (1 << MYKEY_DOWN)) y += SDL_JOYSTICK_AXIS_MAX;
++    }
++    /* SDL only emits events when the value actually changes */
++    SDL_PrivateJoystickAxis(joystick, MMIYOO_JOY_AXIS_LEFTX, x);
++    SDL_PrivateJoystickAxis(joystick, MMIYOO_JOY_AXIS_LEFTY, y);
+ }
+ 
+ static void MMIYOO_JoystickClose(SDL_Joystick *joystick)
+ {
++    pre_joy_bitmaps = 0;
++    MMIYOO_EventSetGamepadAttached(0);
+ }
+ 
+ static void MMIYOO_JoystickQuit(void)
+@@ -124,7 +219,29 @@ static void MMIYOO_JoystickQuit(void)
+ 
+ static SDL_bool MMIYOO_JoystickGetGamepadMapping(int device_index, SDL_GamepadMapping *out)
+ {
+-    return SDL_FALSE;
++#define MMIYOO_BUTTON(field, button) out->field.kind = EMappingKind_Button; out->field.target = (button)
++#define MMIYOO_AXIS(field, axis) out->field.kind = EMappingKind_Axis; out->field.target = (axis)
++    MMIYOO_BUTTON(a, MMIYOO_JOY_A);
++    MMIYOO_BUTTON(b, MMIYOO_JOY_B);
++    MMIYOO_BUTTON(x, MMIYOO_JOY_X);
++    MMIYOO_BUTTON(y, MMIYOO_JOY_Y);
++    MMIYOO_BUTTON(back, MMIYOO_JOY_BACK);
++    MMIYOO_BUTTON(guide, MMIYOO_JOY_GUIDE);
++    MMIYOO_BUTTON(start, MMIYOO_JOY_START);
++    MMIYOO_BUTTON(leftshoulder, MMIYOO_JOY_LEFTSHOULDER);
++    MMIYOO_BUTTON(rightshoulder, MMIYOO_JOY_RIGHTSHOULDER);
++    /* L2/R2 are digital, so they are buttons that SDL turns into fully pressed/released triggers */
++    MMIYOO_BUTTON(lefttrigger, MMIYOO_JOY_LEFTTRIGGER);
++    MMIYOO_BUTTON(righttrigger, MMIYOO_JOY_RIGHTTRIGGER);
++    MMIYOO_BUTTON(dpup, MMIYOO_JOY_DPUP);
++    MMIYOO_BUTTON(dpdown, MMIYOO_JOY_DPDOWN);
++    MMIYOO_BUTTON(dpleft, MMIYOO_JOY_DPLEFT);
++    MMIYOO_BUTTON(dpright, MMIYOO_JOY_DPRIGHT);
++    MMIYOO_AXIS(leftx, MMIYOO_JOY_AXIS_LEFTX);
++    MMIYOO_AXIS(lefty, MMIYOO_JOY_AXIS_LEFTY);
++#undef MMIYOO_BUTTON
++#undef MMIYOO_AXIS
++    return SDL_TRUE;
+ }
+ 
+ SDL_JoystickDriver SDL_MMIYOO_JoystickDriver = {
+diff --git a/src/video/mmiyoo/SDL_event_mmiyoo.c b/src/video/mmiyoo/SDL_event_mmiyoo.c
+index 466749f..8c79f15 100644
+--- a/src/video/mmiyoo/SDL_event_mmiyoo.c
++++ b/src/video/mmiyoo/SDL_event_mmiyoo.c
+@@ -61,6 +61,9 @@ int specialKey = 0;
+ int sendEscape = 0;
+ int hotkeyEnable = 1;
+ int r2Hold = 0;
++static int gamepadAttached = 0; // set while the app has the Miyoo joystick open (i.e. streaming)
++static int keyboardMode = MMIYOO_KEYPAD_MODE; // mode to return to when leaving mouse mode
++static int pre_mode = MMIYOO_KEYPAD_MODE;
+ 
+ uint32_t hotkey = 0;
+ 
+@@ -89,12 +92,60 @@ void sendSpecial() {
+ 
+ void modeSwitchKeypad() {
+     hotkeyEnable = 1;
+-    MMiyooEventInfo.mode = MMIYOO_KEYPAD_MODE;
++    MMiyooEventInfo.mode = keyboardMode;
+     MMiyooEventInfo.keypad.bitmaps &= ~(1 << MYKEY_START);
+-    printf("Mode switched to KEYPAD\n");
++    printf("Mode switched to %s\n", keyboardMode == MMIYOO_GAMEPAD_MODE ? "GAMEPAD" : "KEYPAD");
++}
++
++void modeToggleGamepad() {
++    keyboardMode = (MMiyooEventInfo.mode == MMIYOO_GAMEPAD_MODE) ? MMIYOO_KEYPAD_MODE : MMIYOO_GAMEPAD_MODE;
++    MMiyooEventInfo.mode = keyboardMode;
++    printf("Mode switched to %s\n", keyboardMode == MMIYOO_GAMEPAD_MODE ? "GAMEPAD" : "KEYPAD");
++}
++
++void MMIYOO_EventSetGamepadAttached(int attached)
++{
++    if (event_sem) {
++        SDL_SemWait(event_sem);
++    }
++
++    gamepadAttached = attached;
++    if (attached && moon.gamepad.enabled) {
++        keyboardMode = MMIYOO_GAMEPAD_MODE;
++    } else if (!attached) {
++        keyboardMode = MMIYOO_KEYPAD_MODE;
++    }
++    if (MMiyooEventInfo.mode != MMIYOO_MOUSE_MODE) {
++        MMiyooEventInfo.mode = keyboardMode;
++    }
++    printf("Gamepad %s, mode is %s\n", attached ? "attached" : "detached",
++           MMiyooEventInfo.mode == MMIYOO_GAMEPAD_MODE ? "GAMEPAD" : "KEYPAD/MOUSE");
++
++    if (event_sem) {
++        SDL_SemPost(event_sem);
++    }
++}
++
++uint32_t MMIYOO_EventGetGamepadBitmaps(void)
++{
++    uint32_t bitmaps = 0;
++
++    if (event_sem) {
++        SDL_SemWait(event_sem);
++    }
++    if (MMiyooEventInfo.mode == MMIYOO_GAMEPAD_MODE) {
++        bitmaps = MMiyooEventInfo.keypad.bitmaps;
++    }
++    if (event_sem) {
++        SDL_SemPost(event_sem);
++    }
++    return bitmaps;
+ }
+ 
+ void modeSwitchMouse() {
++    if (MMiyooEventInfo.mode != MMIYOO_MOUSE_MODE) {
++        keyboardMode = MMiyooEventInfo.mode;
++    }
+     MMiyooEventInfo.mode = MMIYOO_MOUSE_MODE;
+     hotkey = 0;
+     hotkeyEnable = 0;
+@@ -197,6 +248,9 @@ void MMIYOO_EventInit(void)
+     MMiyooEventInfo.mouse.x = 0;
+     MMiyooEventInfo.mouse.y = 0;
+     MMiyooEventInfo.mode = MMIYOO_KEYPAD_MODE;
++    keyboardMode = MMIYOO_KEYPAD_MODE;
++    pre_mode = MMIYOO_KEYPAD_MODE;
++    gamepadAttached = 0;
+ 
+ #if defined(MMIYOO)
+     event_fd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+@@ -321,6 +375,9 @@ int EventUpdate(void *data)
+                     } else if (hotkey && (MMiyooEventInfo.keypad.bitmaps & (1 << MYKEY_A))) {
+                         modeSwitchMouse();
+                         MMiyooEventInfo.keypad.bitmaps &= ~(1 << MYKEY_A);
++                    } else if (hotkey && gamepadAttached && (MMiyooEventInfo.keypad.bitmaps & (1 << MYKEY_X))) { // Keyboard <-> gamepad
++                        modeToggleGamepad();
++                        MMiyooEventInfo.keypad.bitmaps &= ~(1 << MYKEY_X);
+                     }
+                 }
+             }
+@@ -355,8 +412,29 @@ void MMIYOO_PumpEvents(_THIS)
+     if (!hotkeyEnable) {
+         SDL_SendKeyboardKey(SDL_RELEASED, moon.customkey.Select);
+     }
+-            
+-    if (MMiyooEventInfo.mode == MMIYOO_KEYPAD_MODE) {
++
++    if (pre_mode != MMiyooEventInfo.mode) {
++        // Release any keys still held from keypad mode so they don't get stuck on the host,
++        // and don't replay buttons that were already held when the mode changed.
++        if (pre_mode == MMIYOO_KEYPAD_MODE) {
++            int cc = 0;
++            uint32_t v0 = pre_keypad_bitmaps;
++
++            for (cc=0; cc<=MYKEY_LAST_BITS; cc++) {
++                if (v0 & 1) {
++                    SDL_SendKeyboardKey(SDL_RELEASED, SDL_GetScancodeFromKey(code[cc]));
++                }
++                v0>>= 1;
++            }
++        }
++        pre_keypad_bitmaps = MMiyooEventInfo.keypad.bitmaps;
++        pre_mode = MMiyooEventInfo.mode;
++    }
++
++    if (MMiyooEventInfo.mode == MMIYOO_GAMEPAD_MODE) {
++        // Buttons are reported through the MMiyoo joystick driver instead of the keyboard
++        pre_keypad_bitmaps = MMiyooEventInfo.keypad.bitmaps;
++    } else if (MMiyooEventInfo.mode == MMIYOO_KEYPAD_MODE) {
+         if (pre_keypad_bitmaps != MMiyooEventInfo.keypad.bitmaps) {
+             int cc = 0;
+             uint32_t v0 = pre_keypad_bitmaps;
+diff --git a/src/video/mmiyoo/SDL_event_mmiyoo.h b/src/video/mmiyoo/SDL_event_mmiyoo.h
+index 7fac231..12af6bb 100644
+--- a/src/video/mmiyoo/SDL_event_mmiyoo.h
++++ b/src/video/mmiyoo/SDL_event_mmiyoo.h
+@@ -56,6 +56,7 @@
+ 
+ #define MMIYOO_KEYPAD_MODE 0
+ #define MMIYOO_MOUSE_MODE  1
++#define MMIYOO_GAMEPAD_MODE 2
+ 
+ typedef struct _MMIYOO_EventInfo {
+     struct _keypad{
+@@ -77,6 +78,8 @@ typedef struct _MMIYOO_EventInfo {
+ extern void MMIYOO_EventInit(void);
+ extern void MMIYOO_EventDeinit(void);
+ extern void MMIYOO_PumpEvents(_THIS);
++extern void MMIYOO_EventSetGamepadAttached(int attached);
++extern uint32_t MMIYOO_EventGetGamepadBitmaps(void);
+ 
+ #endif
+ 
+-- 
+2.43.0
+

@@ -22,5 +22,10 @@
         "acceleration": 2.0,
         "accelerationRate": 2.5,
         "maxAcceleration": 10.0
+    },
+    "gamepad": {
+        "enabled": true,
+        "dpadAsLeftStick": false,
+        "useButtonLabels": false
     }
 }

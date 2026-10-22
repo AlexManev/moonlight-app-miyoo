@@ -42,7 +42,20 @@ This project is in its early stages and has bugs. This is not restricted to Nvid
 Press START to exit mouse mode.
 Currently A is left click, B is right click.
 
-**Note**: Moonlight on the Miyoo will only pass keyboard commands to the host, meaning no mouse and no gamepad input for now.
+### Gamepad mode
+
+While streaming, the Miyoo can act as a controller on the host (it shows up as an Xbox style controller in Sunshine/GeForce Experience). Gamepad mode is on by default when a stream starts; press `Select + X` to switch between gamepad and keyboard mode. The menus before a stream always use the keyboard.
+
+| Miyoo | Host controller |
+|-------|-----------------|
+| B / A / Y / X | A / B / X / Y (by position, see `useButtonLabels`) |
+| D-Pad | D-Pad (or left stick, see `dpadAsLeftStick`) |
+| L1 / R1 | LB / RB |
+| L2 / R2 | LT / RT (fully pressed or released) |
+| Select / Start | Back / Start |
+| Menu | Guide |
+
+The `Select + ...` hotkeys keep working in gamepad mode, and `Select + A` mouse mode returns to gamepad mode when you press Start.
 
 
 ---
@@ -126,9 +139,17 @@ The file will contain:
         "acceleration": 2.0,
         "accelerationRate": 2.5,
         "maxAcceleration": 10.0
+    },
+    "gamepad": {
+        "enabled": true,
+        "dpadAsLeftStick": false,
+        "useButtonLabels": false
     }
 }
 ```
+- `gamepad.enabled`: start streams in gamepad mode (`Select + X` still switches modes). Defaults to `false` if the block is missing.
+- `gamepad.dpadAsLeftStick`: the D-Pad drives the host's left analog stick instead of its D-Pad, for games that only move with the stick.
+- `gamepad.useButtonLabels`: map face buttons by their printed label (Miyoo A -> Xbox A) instead of by position (Miyoo B, the bottom button -> Xbox A).
 - Keybind values will have to be set based on their SDLK value, you can find the full list here: [SDLK Common names](https://www.libsdl.org/release/SDL-1.2.15/docs/html/sdlkey.html)
    - For example; SDLK_BACKSPACE will become BACKSPACE, SDLK_RCTRL will become RCTRL.
 - CPUclock is ranged between 1000 -> 1950, defaulting at 1400. 
@@ -138,7 +159,6 @@ The file will contain:
 - Add settings menu
 - Go back to menu after quitting a game/stream
 - Add options menu hotkey while streaming
-- Gamepad etc
 - FIX APP STARTUP/QUITTING
 
 ---
@@ -188,6 +208,12 @@ The file will contain:
 ---
 
 ## Changelog
+
+### Unreleased
+   - Add gamepad mode: the Miyoo buttons are sent to the host as an Xbox style controller while streaming
+   - Add `Select + X` to switch between gamepad and keyboard mode
+   - Add `gamepad` settings to `settings.json`
+   - Source patch for the new `libSDL2` is in `patches/`
 
 ### v1.5.1
    - Move to minor versioning
